@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torchtoolbox.tools import summary
 
 __all__ = ['birealnet', 'reactnet', 'boolnetv1', 'boolnetv2']
 
@@ -28,8 +29,76 @@ def XNOR(x, y):                                #-1,1
     """Logic XNOR"""
     y = x.mul(y)
     return y
+  
+class GhostSign(nn.Module):
+    def __init__(self, channels, slices = 4, mode = "uniform"):
+      super(GhostSign, self).__init__()
+      self.channels = channels
+      assert (slices  == 1) or (slices > 0 and (slices % 2 == 0)), "the number of slics must be even or one"
+    
+      self.k = slices//2
+    
+      self.mode = mode
+   
+      self.register_buffer("temperature", torch.Tensor([1]))
 
+      slice_1 = []
+      slice_2 = []
+    
+      for i in range(-self.k, self.k+1):
+        if i != 0 and self.k != 0:
+          if i <0:
+            index = i + self.k
+            if self.mode == "uniform":
+              slice_1.append(1.0/float((self.k+1))*i)
+            
+            elif self.mode == "non_uniform":
+              slice_negtive = -(2**(-(2**int(math.log(self.k)/math.log(2))) + abs(i) - 1))
+              slice_1.append(slice_negtive)
+          
+            else:
+              raise ValueError
+          
+          elif i>0:
+            index = i + self.k - 1
+            if self.mode == "uniform":
+              slice_2.append(1.0/float((self.k+1))*i)
+          
+            elif self.mode == "non_uniform":
+              slice_positive = (2**(-(2**(int(math.log(self.k)/math.log(2)))) + abs(i) - 1))
+              slice_2.append(slice_positive)  
+          
+            else:
+              raise ValueError
+        
+      if len(slice_1+slice_2) != 0:
+        self.slice_1  =  (torch.Tensor(slice_1).reshape(1, -1, 1, 1, 1))
+        self.slice_2 = (torch.Tensor(slice_2).reshape(1, -1, 1, 1, 1))
+      else:
+        self.slice_1 = torch.zeros(1, 1, 1, 1, 1)              
+        self.slice_2 = torch.zeros(1, 1, 1, 1, 1) 
+    
+      self.binarize = BinaryActivation(ste = "Hardtanh")
+  
+    def update_temperature(self):
+      self.temperature *= 0.965
+ 
+    def forward(self, x):    
+      
+      assert len(x.size()) == 4, "only support 4-D(N C H W) inputs"
+      
+      if not self.k == 0:  
+        slice = torch.cat(((self.slice_1.to(device = "cuda" if x.is_cuda else "cpu")), (self.slice_2.to(device = "cuda" if x.is_cuda else "cpu"))), dim = 1)
+      
+      else:
+        slice = self.slice_1.to(device = "cuda" if x.is_cuda else "cpu")
 
+      x = x.unsqueeze(1) + slice
+    
+      x = self.binarize(x)
+    
+      return x 
+    
 class BinaryActivation(nn.Module):
     def __init__(self, ste = "Hardtanh"):
         super(BinaryActivation, self).__init__()
@@ -89,9 +158,8 @@ class HardBinaryConv(nn.Module):
         self.groups = groups
         self.number_of_weights = in_chn // groups * out_chn * kernel_size * kernel_size
         self.shape = (out_chn, in_chn//groups, kernel_size, kernel_size)
-        #self.weight = nn.Parameter(torch.rand((self.number_of_weights,1)) * 0.001, requires_grad=True)
         self.weight = nn.Parameter(torch.rand((self.shape)) * 0.001, requires_grad=True)
-
+        
     def forward(self, x):
         
         real_weights = self.weight
@@ -99,6 +167,7 @@ class HardBinaryConv(nn.Module):
         scaling_factor = scaling_factor.detach()
 
         if not self.training:
+
           binary_weights_no_grad = scaling_factor * torch.sign(real_weights)
           
           return  F.conv2d(x, binary_weights_no_grad, stride=self.stride, padding=self.padding, groups = self.groups)
@@ -113,6 +182,75 @@ class HardBinaryConv(nn.Module):
 
         return y
 
+class MultiBConv(nn.Module):
+    def __init__(self,
+        in_channels = 3,
+        out_channels = 64,
+        kernel_size = 2,
+        stride = 1,
+        padding = 1,
+        dilation = 1,
+        groups = 1,
+        bias = False,
+        wb = True,
+        ):
+      super(MultiBConv, self).__init__()
+      
+      self.in_channels = in_channels
+      self.out_channels = out_channels
+      self.kernel_size = kernel_size
+      self.stride = stride
+      self.padding = dilation
+      self.dilation = dilation
+      self.groups = groups
+      self.wb = wb
+    
+      self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+    
+      if bias:
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+      else:
+        self.bias = None
+                    
+      self.binarize = BinaryActivation(ste = "Hardtanh")
+
+      self.register_buffer("temperature", torch.Tensor([1]))
+    
+    def update_temperature(self):
+      self.temperature *= 0.965
+                   
+    def forward(self, x):
+    
+      assert len(x.size()) == 5, "Only support multi slice input"
+      
+      N, S, C, H, W = x.size()
+
+      weight = self.binarize(self.weight)
+    
+      if self.groups>1:
+        if S > self.groups:
+          x = x[:,int((S- self.groups)//2):int((S+self.groups)//2)] 
+        elif S == self.groups:
+          pass
+        else:
+          raise ValueError("The number of slices must be larger than groups ")
+      
+      elif self.groups == 1:
+        x = x[:,S//2].unsqueeze(1)
+    
+      else:
+        raise ValueError("The number of groups must be larger than one ")
+      
+      out = F.conv2d(input = x.view(N, -1, H, W), 
+                  weight = weight, 
+                  bias = self.bias, 
+                  stride= self.stride, 
+                  padding= self.padding, 
+                  dilation= self.dilation, 
+                  groups = self.groups)
+    
+      return out
+
 class BiRealNet_BasicBlock(nn.Module):
     expansion = 1
 
@@ -124,10 +262,18 @@ class BiRealNet_BasicBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         
         self.binary_activation2 = BinaryActivation(ste = "Polynomial")
-        self.binary_conv2 = conv3x3(planes, planes, stride=stride)
+        self.binary_conv2 = conv3x3(planes, planes, stride=1)
         self.bn2 = nn.BatchNorm2d(planes)
-        
-        self.downsample = downsample
+       
+        if stride == 2:
+            self.downsample = nn.Sequential(
+                                    nn.AvgPool2d(kernel_size = 2, stride = 2),
+                                    nn.Conv2d(inplanes, planes, kernel_size = 1, stride = 1, padding = 0),
+                                    nn.BatchNorm2d(planes),
+                                )
+        else:
+            self.downsample = None
+
         self.stride = stride
 
         #self.features = dict()
@@ -169,16 +315,22 @@ class ReActNet_BasicBlock(nn.Module):
 
         self.move2_0 = LearnableBias(planes)
         self.binary_activation2 = BinaryActivation(ste = "Polynomial")
-        self.binary_conv2 = HardBinaryConv(planes, planes, stride=stride)
+        self.binary_conv2 = HardBinaryConv(planes, planes, stride=1)
         self.bn2 = nn.BatchNorm2d(planes)
         self.move2_1 = LearnableBias(planes)
         self.prelu2 = nn.PReLU(planes)
         self.move2_2 = LearnableBias(planes)
-
-        self.downsample = downsample
-        self.stride = stride
         
-        #self.features = dict()
+        if stride == 2:
+            self.downsample = nn.Sequential(
+                                    nn.AvgPool2d(kernel_size = 2, stride = 2),
+                                    nn.Conv2d(inplanes, planes, kernel_size = 1, padding = 0),
+                                    nn.BatchNor2md(planes),
+                                )
+        else:
+            self.downsample = None
+        
+        self.stride = stride
         
     def forward(self, x):
         residual = x
@@ -214,22 +366,32 @@ class ReActNet_BasicBlock(nn.Module):
 class BoolNetV1_BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes, stride=1, max_slices = 1, downsample=None):
         super(BoolNetV1_BasicBlock, self).__init__()
 
-        self.binary_conv1 = HardBinaryConv(inplanes, planes, stride=stride)
+        self.binary_conv1 = MultiBConv(inplanes, planes, 3, stride, 1, groups = max_slices)  
         self.bn1 = nn.BatchNorm2d(planes)
-        self.binary_activation1 = BinaryActivation(ste = "Hardtanh")
+        self.binary_activation1 = GhostSign(planes, slices = max_slices)
         
-        self.binary_conv2 = HardBinaryConv(planes, planes, stride=stride)
+        self.binary_conv2 = MultiBConv(planes, planes, 3, 1, 1, groups = max_slices)  
         self.bn2 = nn.BatchNorm2d(planes)
-        self.binary_activation2 = BinaryActivation(ste = "Hardtanh")
+        self.binary_activation2 = GhostSign(planes, slices = max_slices)
         
-        self.downsample = downsample
+        if stride == 2:
+            self.downsample = nn.Sequential(  
+                                    HardBinaryConv(inplanes, planes, kernel_size = 1, stride = 1, padding = 0),
+                                    nn.maxpool2d(kernel_size = 2, stride = 2),
+                                    nn.BatchNorm2d(planes),
+                                    BinaryActivation(ste = "Hardtanh")
+                                )
+        else:    
+            self.downsample = None
+
         self.stride = stride
 
     def forward(self, x):
         
+        assert len(x.size()) == 5, "only support 5-D(N S C H W) input"
         
         residual = x
         
@@ -238,7 +400,7 @@ class BoolNetV1_BasicBlock(nn.Module):
         x = self.binary_activation1(x)
         
         if self.downsample is not None:
-            residual = self.downsample(residual)
+            residual = self.downsample(residual.view(N, -1, H, w))
 
         x = XNOR(x, residual)
         
@@ -253,11 +415,15 @@ class BoolNetV1_BasicBlock(nn.Module):
 class BoolNetV2_BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes, stride=1, max_slices = 1, downsample=None):
         super(BoolNetV2_BasicBlock, self).__init__()
+        
+        if stride == 2:
+            inplanes = 2*inplanes
+
         self.inplanes = inplanes
         
-        self.binary_conv1 = HardBinaryConv(inplanes, planes, stride=stride)
+        self.binary_conv1 = MultiBConv(inplanes, planes, 3, stride, 1, groups = max_slices)  
         self.bn1 = nn.BatchNorm2d(planes)
         self.global_zero_points1 = nn.Sequential(
                                     nn.BatchNorm2d(planes),
@@ -266,9 +432,9 @@ class BoolNetV2_BasicBlock(nn.Module):
                                     nn.BatchNorm2d(planes),
                                     nn.AdaptiveMaxPool2d((1,1))
                                   )                  
-        self.binary_activation1 = BinaryActivation(ste = "Hardtanh")
+        self.binary_activation1 = GhostSign(planes, slices = max_slices)
         
-        self.binary_conv2 = HardBinaryConv(planes, planes, stride=stride)
+        self.binary_conv2 = MultiBConv(planes, planes, 3, 1, 1, groups = max_slices)  
         self.bn2 = nn.BatchNorm2d(planes)
         self.global_zero_points2 = nn.Sequential(
                                     nn.BatchNorm2d(planes),
@@ -277,47 +443,61 @@ class BoolNetV2_BasicBlock(nn.Module):
                                     nn.BatchNorm2d(planes),
                                     nn.AdaptiveMaxPool2d((1,1)) 
                                   )
-        self.binary_activation2 = BinaryActivation(ste = "Hardtanh")
         
-        self.downsample = downsample
+        self.binary_activation2 = GhostSign(planes, slices = max_slices)
+        
+        if stride == 2:
+            self.downsample = nn.Sequential(
+                                    HardBinaryConv(inplanes*max_slices, planes, kernel_size = 1, padding = 0, groups = max_slices),
+                                    nn.MaxPool2d(kernel_size = 2, stride = 2),
+                                    nn.BatchNorm2d(planes)
+                                )
+        else:
+            self.downsample = None
+
         self.stride = stride
 
     def forward(self, input):
-        N, C, H, W = input.size()
+        N, S, C, H, W = input.size()
         
         #assert C // self.inplanes == 2, "The channels of input feature should  be twice of the first binary convolution input channels !"
         
         #"channel split"
-        x = input[:, :C//2].contiguous()
-        residual = x
-        z = input[:, C//2:].contiguous()
-        
+        if not self.stride == 2:
+            x = input[:, :, :C//2].contiguous()
+            residual = x
+            z = input[:, :, C//2:].contiguous()
+        else:
+            x = input
+            residual = input
+            z = input
+
         x = self.binary_conv1(x)
         x = self.bn1(x).add(self.global_zero_points1(x))
         x = self.binary_activation1(x)
         
         if self.downsample is not None:
-            residual = self.downsample(residual)
+            residual = self.downsample(residual.view(N, -1, H , W))
 
         x = XNOR(x, residual)
         
         y = self.binary_conv2(x)
-        y = self.bn2(y).add(self.global_zero_points2(x))
+        y = self.bn2(y).add(self.global_zero_points2(y))
         y = self.binary_activation2(y)
-        
-        y_1 = OR(y, residual).unsqueeze(1)
-        y_2 = z.unsqueeze(1)
+          
+        y_1 = OR(y, residual).unsqueeze(2)
+        y_2 = z.unsqueeze(2)
         
         #"channel concatenet"
-        y = torch.cat((y_1, y_2), dim = 1)  
+        y = torch.cat((y_1, y_2), dim = 2)  
         
         #"channel shuffle"
-        y = y.transpose(1,2).contiguous().view(N, -1, H, W).contiguous()
+        y = y.transpose(2,3).contiguous().view(N, S, -1, H//self.stride, W//self.stride).contiguous()
         
         return y
 
 class Architecture(nn.Module):
-  def __init__(self, arc = "BiRealNet", inplanes = 64, out_planes = 64):
+  def __init__(self, arc = "BiRealNet", inplanes = 64, out_planes = 64, stride = 1, max_slices = 1):
     super(Architecture, self).__init__()
     
     assert arc in {"BiRealNet", "ReActNet", "BoolNetV1", "BoolNetV2"}, "Only support {BiRealNet, ReActNet, BoolNetV1, BoolNetV2}, but got {}".format(arc) 
@@ -325,16 +505,16 @@ class Architecture(nn.Module):
     self.arc = arc
     
     if self.arc == "BiRealNet":
-      self.basicblock = BiRealNet_BasicBlock(inplanes = inplanes, planes = out_planes)
+      self.basicblock = BiRealNet_BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride)
     
     elif self.arc == "ReActNet":
-      self.basicblock = ReActNet_BasicBlock(inplanes = inplanes, planes = out_planes)
+      self.basicblock = ReActNet_BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride)
     
     elif self.arc == "BoolNetV1":
-      self.basicblock = BoolNetV1_BasicBlock(inplanes = inplanes, planes = out_planes)
+      self.basicblock = BoolNetV1_BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride, max_slices = max_slices)
     
     elif self.arc == "BoolNetV2":
-      self.basicblock = BoolNetV2_BasicBlock(inplanes = inplanes, planes = out_planes) 
+      self.basicblock = BoolNetV2_BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride, max_slices = max_slices) 
   
   def forward(self, x):
     return self.basicblock(x)
@@ -345,10 +525,12 @@ if __name__ == "__main__":
   parser.add_argument("--inplanes", default=64, type = int, help="specifing the inplanes of basicblock")
   parser.add_argument("--out_planes", default=64, type = int, help="specifing the out_planes of basicblock")
   parser.add_argument("--mode", default="train", type = str, help="specifing the computation type of neural network")
-
-  opt = parser.parse_args()
-  model = Architecture(arc = opt.arc, inplanes = opt.inplanes, out_planes = opt.out_planes)
+  parser.add_argument("--max_slices", default = 1, type = int, help="specifing the number of slices to be used in MultiSlice strategy")
+  parser.add_argument("--stride", default = 1, type = int, help="using reduce residual shortcut if stride == 2")
   
+  opt = parser.parse_args()
+  model = Architecture(arc = opt.arc, inplanes = opt.inplanes, out_planes = opt.out_planes, stride = opt.stride, max_slices = opt.max_slices)
+    
   if opt.mode == "train":
     model.train()
   
@@ -357,14 +539,18 @@ if __name__ == "__main__":
 
   writer = SummaryWriter()
   
-  if not opt.arc == "BoolNetV2":
+  if not opt.arc in {"BoolNetV1", "BoolNetV2"}:
     input_tensor = torch.randn(1, opt.inplanes, 32, 32)
   
+  elif opt.arc == "BoolNetV2":
+    input_tensor = torch.randn(1, opt.max_slices, 2*opt.inplanes, 32, 32)
+  
   else:
-    input_tensor = torch.randn(1, 2*opt.inplanes, 32, 32)
+    input_tensor = torch.randn(1, opt.max_slices, opt.inplanes, 32, 32)
 
   out_tensor = model(input_tensor)
-
+  
+  summary(model, input_tensor)
   writer.add_graph(model, input_tensor)
   
   writer.close()
