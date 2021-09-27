@@ -251,6 +251,65 @@ class MultiBConv(nn.Module):
     
       return out
 
+class XNORNet_BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(XNORNet_BasicBlock, self).__init__()
+        
+        self.bn1 = nn.BatchNorm2d(inplanes)
+        self.binary_activation1 = BinaryActivation(ste = "Polynomial")
+        self.binary_conv1 = conv3x3(inplanes, planes, stride=stride)
+        
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.binary_activation2 = BinaryActivation(ste = "Polynomial")
+        self.binary_conv2 = conv3x3(planes, planes, stride=1)
+        
+        self.relu = nn.ReLU()
+        
+        if stride == 2:
+            self.downsample = nn.Sequential(
+                                    nn.AvgPool2d(kernel_size = 2, stride = 2),
+                                    nn.Conv2d(inplanes, planes, kernel_size = 1, stride = 1, padding = 0),
+                                    nn.BatchNorm2d(planes),
+                                )
+        else:
+            self.downsample = None
+
+        self.stride = stride
+        
+        self.k_weight = Variable(torch.ones(1,1,self.kernel_size,self.kernel_size).mul(1/(self.kernel_size**2)))
+        
+    def get_scaling(self, x):
+        k = x.mean(1, keepdim = True)
+        if k.is_cuda:
+          self.k_weight.cuda()
+        k = F.conv(k, self.k_weight, padding = self.padding, stride = self.stride, dilation = dilation, groups = grpups)    
+        
+        return k
+            
+    def forward(self, x):
+        
+        x = self.bn1(x)
+        residual = x
+        k_1 = self.get_scaling(x)
+        
+        x = self.binary_activation1(x)
+        x = self.binary_conv1(x).mul(k_1)
+        x = self.relu(x)
+        
+        if self.downsample is not None:
+            residual = self.downsample(residual)
+        
+        y = self.bn2(y)
+        y += residual
+        k_2 = self.get_scaling(y)
+        
+        y = self.binary_activation2(x)
+        y = self.binary_conv2(y).mul(k_2)
+        y = self.relu(y)
+        return y
+        
 class BiRealNet_BasicBlock(nn.Module):
     expansion = 1
 
@@ -369,7 +428,12 @@ class BoolNetV1_BasicBlock(nn.Module):
     def __init__(self, inplanes, planes, stride=1, max_slices = 1, downsample=None):
         super(BoolNetV1_BasicBlock, self).__init__()
 
-        self.binary_conv1 = MultiBConv(inplanes, planes, 3, stride, 1, groups = max_slices)  
+        self.binary_conv1 = MultiBConv(inplanes, planes, 3, 1, 1, groups = max_slices)
+        if stride == 2:
+            self.maxpool = nn.MaxPool2d(kernel_size = 3, stride = 2, padding = 1)
+        else:
+            self.maxpool = lambda x:x
+            
         self.bn1 = nn.BatchNorm2d(planes)
         self.binary_activation1 = GhostSign(planes, slices = max_slices)
         
@@ -396,19 +460,16 @@ class BoolNetV1_BasicBlock(nn.Module):
         residual = x
         
         x = self.binary_conv1(x)
+        x = self.maxpool(x)
         x = self.bn1(x)
         x = self.binary_activation1(x)
         
         if self.downsample is not None:
             residual = self.downsample(residual.view(N, -1, H, w))
 
-        x = XNOR(x, residual)
-        
         y = self.binary_conv2(x)
         y = self.bn2(y)
         y = self.binary_activation2(y)
-        
-        y = OR(y, x)
         
         return y
 
@@ -418,32 +479,21 @@ class BoolNetV2_BasicBlock(nn.Module):
     def __init__(self, inplanes, planes, stride=1, max_slices = 1, downsample=None):
         super(BoolNetV2_BasicBlock, self).__init__()
         
-        if stride == 2:
+        if inplanes != planes:
             inplanes = 2*inplanes
-
+        
         self.inplanes = inplanes
         
-        self.binary_conv1 = MultiBConv(inplanes, planes, 3, stride, 1, groups = max_slices)  
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.global_zero_points1 = nn.Sequential(
-                                    nn.BatchNorm2d(planes),
-                                    BinaryActivation(ste = "Hardtanh"),
-                                    HardBinaryConv(planes, planes, groups = planes),
-                                    nn.BatchNorm2d(planes),
-                                    nn.AdaptiveMaxPool2d((1,1))
-                                  )                  
+        self.binary_conv1 = MultiBConv(inplanes, planes, 3, 1, 1, groups = max_slices)
+        if stride == 2:
+            self.maxpool = nn.MaxPool2d(kernel_size = 3, strride = 2, padding = 1)
+        else:
+            self.maxpool = lambda x:x
+        self.bn1 = nn.BatchNorm2d(planes)            
         self.binary_activation1 = GhostSign(planes, slices = max_slices)
         
         self.binary_conv2 = MultiBConv(planes, planes, 3, 1, 1, groups = max_slices)  
         self.bn2 = nn.BatchNorm2d(planes)
-        self.global_zero_points2 = nn.Sequential(
-                                    nn.BatchNorm2d(planes),
-                                    BinaryActivation(ste = "Hardtanh"),
-                                    HardBinaryConv(planes, planes, groups = planes),
-                                    nn.BatchNorm2d(planes),
-                                    nn.AdaptiveMaxPool2d((1,1)) 
-                                  )
-        
         self.binary_activation2 = GhostSign(planes, slices = max_slices)
         
         if stride == 2:
@@ -463,29 +513,31 @@ class BoolNetV2_BasicBlock(nn.Module):
         #assert C // self.inplanes == 2, "The channels of input feature should  be twice of the first binary convolution input channels !"
         
         #"channel split"
-        if not self.stride == 2:
+        if C // self.inplanes == 2:
             x = input[:, :, :C//2].contiguous()
             residual = x
-            z = input[:, :, C//2:].contiguous()
         else:
             x = input
             residual = input
-            z = input
-
+            
         x = self.binary_conv1(x)
-        x = self.bn1(x).add(self.global_zero_points1(x))
+        x = self.maxpool(x)
+        x = self.bn1(x)
         x = self.binary_activation1(x)
         
         if self.downsample is not None:
             residual = self.downsample(residual.view(N, -1, H , W))
-
-        x = XNOR(x, residual)
-        
+  
         y = self.binary_conv2(x)
-        y = self.bn2(y).add(self.global_zero_points2(y))
+        y = self.bn2(y)
         y = self.binary_activation2(y)
           
-        y_1 = OR(y, residual).unsqueeze(2)
+        if C // self.inlanes == 2:
+            z = input[:,:,:C//2:].contiguous()
+        else:
+            z = residual
+
+        y_1 = y.unsqueeze(2)
         y_2 = z.unsqueeze(2)
         
         #"channel concatenet"
@@ -516,6 +568,9 @@ class Architecture(nn.Module):
     elif self.arc == "BoolNetV2":
       self.basicblock = BoolNetV2_BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride, max_slices = max_slices) 
   
+  	elif self.arc == "XNORNet":
+  		self.basciblock = BasicBlock(inplanes = inplanes, planes = out_planes, stride = stride)
+  		
   def forward(self, x):
     return self.basicblock(x)
         
