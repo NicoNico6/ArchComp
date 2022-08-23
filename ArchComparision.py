@@ -783,11 +783,11 @@ class FFN_1x1(nn.Module):
         return x
 
 
-class BNext_BasicBlock(nn.Module):
+class BNext_BasicModule(nn.Module):
     expansion = 1
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, drop_rate=0.1, mode="scale"):
-        super(BNext_BasicBlock, self).__init__()
+        super(BNext_BasicModule, self).__init__()
         self.inplanes = inplanes
         self.planes = planes
 
@@ -819,6 +819,20 @@ class BNext_BasicBlock(nn.Module):
         return y
 
 
+class BNext_BasicBlock(nn.Module):
+
+    def __init__(self, inplanes, planes, stride, downsample, drop_rate):
+        super(BNext_BasicBlock, self).__init__()
+        self.Attention = BNext_BasicModule(inplanes, planes, stride, None, drop_rate = drop_rate, mode = "scale")
+        self.FFN = BNext_BasicModule(planes, planes, 1, None, drop_rate = drop_rate, mode = "bias")
+
+    def forward(self, input):
+        x = self.Attention(input)
+        y = self.FFN(x)
+
+        return y
+
+
 class Architecture(nn.Module):
     def __init__(self, arc="BiRealNet", inplanes=64, out_planes=64, stride=1, max_slices=1):
         super(Architecture, self).__init__()
@@ -844,10 +858,8 @@ class Architecture(nn.Module):
             self.basciblock = BasicBlock(inplanes=inplanes, planes=out_planes, stride=stride)
 
         elif self.arc == "BNext":
-            self.basicblock = nn.Sequential(
-                                BNext_BasicBlock(inplanes=inplanes, planes=out_planes, stride=stride, mode = "scale"),
-                                BNext_BasicBlock(inplanes=out_planes, planes = out_planes, stride = 1, mode = "bias")
-                                )
+            self.basicblock = BNext_BasicBlock(inplanes=inplanes, planes=out_planes, stride=stride, downsample = None, drop_rate = 0.1)
+                      
                                 
     def forward(self, x):
         return self.basicblock(x)
@@ -886,7 +898,7 @@ if __name__ == "__main__":
 
     out_tensor = model(input_tensor)
 
-    summary(model, input_tensor)
+    #summary(model, input_tensor)
     writer.add_graph(model, input_tensor)
 
     writer.close()
